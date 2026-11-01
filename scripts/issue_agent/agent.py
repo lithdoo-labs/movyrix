@@ -9,7 +9,6 @@ import json
 import os
 from pathlib import Path
 import re
-import shutil
 import subprocess
 import sys
 from urllib.error import HTTPError
@@ -273,18 +272,21 @@ def execute(args):
     patch_path = Path(args.patch)
     patch_path.write_bytes(b"")
     state = Path(os.environ["ISSUE_AGENT_STATE"]) / "issues" / f"issue-{inp['issue']}"
-    workspace = state / "workspace"
+    # OpenCode V2 must operate in the actual Actions checkout, not a copied .git tree.
+    workspace = Path(args.source).resolve()
     metadata = state / "metadata.json"
     result = {"status": "failed", "issue": inp["issue"], "turn": inp["turn"],
               "session_id": None, "continuity": "unavailable", "summary": ""}
     try:
         state.mkdir(parents=True, exist_ok=True)
         prior = json.loads(metadata.read_text()) if metadata.exists() else None
-        if inp["operation"] == "start" and prior:
-            raise RuntimeError("previous session state exists; refusing accidental reset")
-        if inp["operation"] == "revise":
-            if not prior or prior.get("issue") != inp["issue"]:
-                raise RuntimeError("persistent Issue session metadata missing")
+        if inp["operation"] == "revise" and not prior:
+            raise RuntimeError("persistent Issue session metadata missing")
+        if prior:
+            if prior.get("issue") != inp["issue"]:
+                raise RuntimeError("persistent session belongs to a different Issue")
+            # An initial publish failure may leave a valid session but no PR.
+            # /agent start retries should resume it, not silently reset context.
             candidate = prior.get("session_id", "")
             if not SESSION_RE.fullmatch(candidate):
                 raise RuntimeError("persistent session ID invalid")
@@ -295,12 +297,12 @@ def execute(args):
             if verify.returncode:
                 raise RuntimeError("existing OpenCode session missing; not silently starting a new one")
             result.update(session_id=candidate, continuity="resumed")
-        if workspace.exists():
-            shutil.rmtree(workspace)
-        shutil.copytree(args.source, workspace, symlinks=False,
-                        ignore=shutil.ignore_patterns("__pycache__", ".pytest_cache"))
-        git("reset", "--hard", "HEAD", cwd=workspace)
-        git("clean", "-fd", cwd=workspace)
+        if git("rev-parse", "--show-toplevel", cwd=workspace).stdout.strip() != str(workspace):
+            raise RuntimeError("Actions checkout is not the expected Git worktree root")
+        if git("rev-parse", "HEAD", cwd=workspace).stdout.strip() != inp["base_sha"]:
+            raise RuntimeError("Actions checkout differs from preflight approved SHA")
+        if git("status", "--porcelain", cwd=workspace).stdout.strip():
+            raise RuntimeError("Actions checkout has unexpected pre-existing changes")
         prompt = (
             f"Repository: {REPO}\nIssue #{inp['issue']}: {inp['issue_title']}\n"
             f"Original specification:\n{inp['issue_body']}\n\n"
@@ -321,7 +323,7 @@ def execute(args):
         env["OPENCODE_DISABLE_EXTERNAL_SKILLS"] = "1"
         binary = os.getenv("OPENCODE_BIN", "opencode2")
         command = [binary, "run", "--standalone", "--auto", "--format", "json"]
-        if inp["operation"] == "revise":
+        if result["session_id"]:
             command.extend(["--session", result["session_id"]])
         else:
             command.extend(["--title", f"movyrix issue #{inp['issue']}"])
@@ -342,9 +344,11 @@ def execute(args):
                                capture_output=True, check=True).stdout
         if len(patch) > MAX_PATCH_BYTES:
             raise RuntimeError("generated patch exceeds maximum allowed size")
+        if inp["operation"] == "start" and not patch:
+            raise RuntimeError("OpenCode produced no working-tree changes in Actions checkout")
         patch_path.write_bytes(patch)
         result.update(status="ok", session_id=session_id,
-                      continuity="resumed" if inp["operation"] == "revise" else "new",
+                      continuity="resumed" if prior else "new",
                       changed_files=paths, summary=summary or "OpenCode completed successfully.")
         metadata.write_text(json.dumps({"issue": inp["issue"], "session_id": session_id,
                                         "turn": inp["turn"]}, indent=2) + "\n")
