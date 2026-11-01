@@ -1,0 +1,29 @@
+name: Issue Agent Validation
+
+on:
+  pull_request:
+    paths:
+      - "scripts/issue_agent/**"
+      - "tests/test_issue_agent.py"
+      - ".github/workflows/issue-agent.yml"
+      - ".github/workflows/issue-agent-validation.yml"
+      - "docs/issue-agent.md"
+
+permissions:
+  contents: read
+
+jobs:
+  unit-and-integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Python syntax
+        run: python3 -m py_compile scripts/issue_agent/agent.py tests/test_issue_agent.py
+      - name: Unit and two-turn fake OpenCode tests
+        run: python3 -m unittest discover -s tests -p 'test_issue_agent.py' -v
+      - name: Verify no self-hosted Runner in tests
+        run: |
+          echo "All CI tests run on ubuntu-latest with no model/API keys."

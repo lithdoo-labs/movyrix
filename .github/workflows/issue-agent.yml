@@ -1,0 +1,150 @@
+name: Issue Agent (OpenCode 2)
+
+on:
+  issue_comment:
+    types: [created]
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: "Existing issue number (created by lithdoo)"
+        required: true
+        type: number
+      operation:
+        description: "First implementation or a revision of the same PR"
+        required: true
+        type: choice
+        options: [start, revise]
+
+# GitHub Actions admits at most one running and one pending job per concurrency
+# group; newer pending commands may coalesce. Preflight collects all feedback
+# since the last published turn so no review text is silently lost.
+concurrency:
+  group: movyrix-issue-agent-${{ github.event.issue.number || inputs.issue_number }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  preflight:
+    name: Authenticate and snapshot Issue / PR inputs
+    if: >-
+      ${{
+        github.repository == 'lithdoo-labs/movyrix' &&
+        (
+          (github.event_name == 'issue_comment' &&
+           github.event.issue.pull_request == null &&
+           github.event.comment.user.id == 130959182 &&
+           github.event.issue.user.id == 130959182 &&
+           (github.event.comment.body == '/agent start' || github.event.comment.body == '/agent revise')) ||
+          (github.event_name == 'workflow_dispatch' && github.actor == 'lithdoo')
+        )
+      }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: read
+      pull-requests: read
+    outputs:
+      allowed: ${{ steps.preflight.outputs.allowed }}
+      base_sha: ${{ steps.preflight.outputs.base_sha }}
+      issue_number: ${{ steps.preflight.outputs.issue_number }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          persist-credentials: false
+      - name: Preflight (read-only GitHub token)
+        id: preflight
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_ISSUE_NUMBER: ${{ inputs.issue_number }}
+          INPUT_OPERATION: ${{ inputs.operation }}
+          ACTOR: ${{ github.actor }}
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+        run: |
+          python3 scripts/issue_agent/agent.py preflight \
+            --event "$GITHUB_EVENT_PATH" \
+            --output "$RUNNER_TEMP/issue-agent-input.json" \
+            --github-output "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        if: steps.preflight.outputs.allowed == 'true'
+        with:
+          name: issue-agent-input
+          path: ${{ runner.temp }}/issue-agent-input.json
+          if-no-files-found: error
+          retention-days: 1
+
+  execute:
+    name: OpenCode turn on organization runner
+    needs: preflight
+    if: needs.preflight.outputs.allowed == 'true'
+    runs-on: [self-hosted, linux, x64, opencode, labs]
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.preflight.outputs.base_sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: issue-agent-input
+          path: ${{ runner.temp }}/issue-agent-input
+      - name: Run isolated OpenCode turn and generate patch
+        env:
+          OPENCODE_BIN: opencode2
+          XDG_DATA_HOME: /runner/state/lithdoo-labs-org/agent-projects/movyrix/opencode-data
+          ISSUE_AGENT_STATE: /runner/state/lithdoo-labs-org/agent-projects/movyrix
+        run: |
+          python3 scripts/issue_agent/agent.py execute \
+            --input "$RUNNER_TEMP/issue-agent-input/issue-agent-input.json" \
+            --result "$RUNNER_TEMP/issue-agent-result.json" \
+            --patch "$RUNNER_TEMP/issue-agent.patch" \
+            --source "$GITHUB_WORKSPACE"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: issue-agent-result
+          path: |
+            ${{ runner.temp }}/issue-agent-result.json
+            ${{ runner.temp }}/issue-agent.patch
+          if-no-files-found: warn
+          retention-days: 1
+
+  publish:
+    name: Review patch, update same PR and reply to Issue
+    needs: [preflight, execute]
+    if: always() && needs.preflight.outputs.allowed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      actions: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.preflight.outputs.base_sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: issue-agent-input
+          path: ${{ runner.temp }}/issue-agent-input
+      - uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: issue-agent-result
+          path: ${{ runner.temp }}/issue-agent-result
+      - name: Publish safely (only this job has write token)
+        env:
+          GH_TOKEN: ${{ secrets.AGENT_GITHUB_TOKEN || github.token }}
+        run: |
+          python3 scripts/issue_agent/agent.py publish \
+            --input "$RUNNER_TEMP/issue-agent-input/issue-agent-input.json" \
+            --result "$RUNNER_TEMP/issue-agent-result/issue-agent-result.json" \
+            --patch "$RUNNER_TEMP/issue-agent-result/issue-agent.patch"
