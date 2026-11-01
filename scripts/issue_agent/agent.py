@@ -348,7 +348,15 @@ def execute(args):
         if not session_id:
             raise RuntimeError("OpenCode completed without a recoverable session ID")
         summary = safe_summary(response_from_events(completed.stdout))
-        git("add", "-A", cwd=workspace)
+        # Python tests may create bytecode/cache files alongside trusted scripts.
+        # Do not stage these generated artifacts; keep all real changes subject
+        # to validate_paths() checks (including protected .github/ and scripts).
+        git("add", "-A", "--", ".",
+            ":(exclude,glob)**/__pycache__/**",
+            ":(exclude,glob)**/*.pyc",
+            ":(exclude,glob)**/.pytest_cache/**",
+            ":(exclude,glob)**/.mypy_cache/**",
+            cwd=workspace)
         paths = git("diff", "--cached", "--name-only", "-z", cwd=workspace).stdout.split("\0")
         paths = [p for p in paths if p]
         validate_paths(paths)
