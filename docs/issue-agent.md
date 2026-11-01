@@ -40,7 +40,7 @@ The publisher rejects modifications to .github/, scripts/issue_agent/, AGENTS.md
 - Session metadata: **/runner/state/lithdoo-labs-org/agent-projects/movyrix/issues/issue-N/metadata.json**
 - Execution worktree: **$GITHUB_WORKSPACE** in the organization Runner job (the trusted checkout is refreshed each turn). OpenCode runs directly in this worktree; its **session data**, not the checkout, is persisted separately.
 - OpenCode data: **/runner/state/lithdoo-labs-org/agent-projects/movyrix/opencode-data**
-- Published Issue comments contain a marker identifying the processed turn and triggering comment.
+- Published Issue comments contain a marker identifying the processed turn and triggering comment. Only markers from the Actions bot or authorized owner are trusted; other public commenters cannot forge checkpoints.
 
 A revision refuses to start if the original session has been lost; it does not pretend a new model session has the same context. After a failed first publication with no PR, a fresh /agent start resumes the saved initial session rather than discarding it. PRs that are already closed or merged cannot be revised. Use a new Issue for a new task.
 
@@ -75,5 +75,5 @@ The connected ChatGPT GitHub API lacks an Actions workflow_dispatch operation; o
 
 - Preflight rejects unauthorized, closed, duplicate, or non-ordinary Issues, and revisions without fresh owner feedback.
 - Execute errors are reported back to the Issue when the publisher has permission; check OpenCode availability and state-volume permissions without printing API keys.
-- Publish failures: verify GitHub Action PR creation policy and write permissions, the approved source SHA and branch rules.
+- Publish failures: verify GitHub Action PR creation policy and write permissions, the approved source SHA and branch rules. If the Agent pushed branch agent/issue-N but GitHub denied Draft PR creation, enable the repository PR creation setting (or supply AGENT_GITHUB_TOKEN), then comment **/agent start** again. The workflow validates the prior Agent commit and opens the missing Draft PR **without rerunning OpenCode**. The saved Session remains available for the next /agent revise.
 - The model's session content lives on the self-hosted Runner; do not delete persistent state when cleaning a PR.
