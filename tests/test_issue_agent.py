@@ -159,7 +159,8 @@ class RunnerIntegrationTests(unittest.TestCase):
             "issue": 42, "operation": operation, "turn": turn,
             "issue_title": "Update README", "issue_body": "Make a change",
             "feedback": [{"source": "Issue", "text": "Please refine it"}] if turn > 1 else [],
-            "base_sha": "x", "branch": "agent/issue-42", "command_id": turn
+            "base_sha": run("git", "rev-parse", "HEAD", cwd=self.source).stdout.strip(),
+            "branch": "agent/issue-42", "command_id": turn
         }))
         result = self.root / f"result-{turn}.json"
         artifact = self.root / f"patch-{turn}.diff"
@@ -174,12 +175,26 @@ class RunnerIntegrationTests(unittest.TestCase):
         self.assertEqual(initial["status"], "ok", initial)
         self.assertEqual(initial["continuity"], "new")
         self.assertIn(b"OpenCode changed the project", patch_one)
+        # Mirror publish: commit the first patch, then Actions checkout resumes
+        # from the PR head before turn two.
+        run("git", "add", ".", cwd=self.source)
+        run("git", "commit", "-qm", "published first turn", cwd=self.source)
         resumed, patch_two = self.execute("revise", 2)
         self.assertEqual(resumed["status"], "ok", resumed)
         self.assertEqual(resumed["continuity"], "resumed")
         self.assertEqual(initial["session_id"], resumed["session_id"])
         self.assertEqual(json.loads((self.state / "issues/issue-42/metadata.json").read_text())["turn"], 2)
-        self.assertEqual(patch_one, patch_two)
+        self.assertGreater(len(patch_two), 0)
+
+    def test_failed_first_publication_reuses_session_on_start_retry(self):
+        initial, _ = self.execute("start", 1)
+        self.assertEqual(initial["status"], "ok", initial)
+        run("git", "reset", "--hard", "HEAD", cwd=self.source)
+        retry, patch = self.execute("start", 2)
+        self.assertEqual(retry["status"], "ok", retry)
+        self.assertEqual(retry["continuity"], "resumed")
+        self.assertEqual(retry["session_id"], initial["session_id"])
+        self.assertGreater(len(patch), 0)
 
     def test_refuses_revision_without_persistent_session(self):
         resumed, patch = self.execute("revise", 2)
