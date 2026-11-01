@@ -125,6 +125,10 @@ def get_last_checkpoint(comments, issue, before_id):
     for item in comments:
         if before_id and item["id"] >= before_id:
             continue
+        # A public repository allows arbitrary users to comment. Only the
+        # Actions bot or the authorized human can publish trusted checkpoints.
+        if (item.get("user") or {}).get("id") not in (41898282, OWNER_ID):
+            continue
         match = STATUS_RE.search(item.get("body") or "")
         if match and int(match[1]) == issue:
             if result is None or item["id"] > result["id"]:
@@ -196,19 +200,28 @@ def preflight(args):
                 or pr.get("base", {}).get("ref") != "main"
                 or MARKER.format(issue=issue_number) not in (pr.get("body") or "")):
             raise RuntimeError("Agent PR provenance mismatch")
+    orphan_sha = None
     if operation == "start":
         try:
-            api("GET", f"/repos/{REPO}/git/ref/heads/{branch_name(issue_number)}")
+            existing_ref = api("GET", f"/repos/{REPO}/git/ref/heads/{branch_name(issue_number)}")
         except LookupError:
             pass
         else:
-            raise RuntimeError("Agent branch already exists without a bound PR")
+            orphan_sha = existing_ref["object"]["sha"]
+            committed = api("GET", f"/repos/{REPO}/commits/{orphan_sha}")
+            message = committed.get("commit", {}).get("message", "")
+            if (committed.get("author", {}).get("login") != "github-actions[bot]"
+                    or not message.startswith(f"feat(agent): issue #{issue_number} turn ")):
+                raise RuntimeError("existing Issue branch was not published by this Agent")
+            # A previous job may have pushed the branch but failed creating
+            # the PR due to GitHub Actions settings. Recover without a model run.
+            operation = "recover"
     comments = pages(f"/repos/{REPO}/issues/{issue_number}/comments")
     checkpoint = get_last_checkpoint(comments, issue_number, comment_id)
     feedback = collect_feedback(issue_number, operation, comment_id, pr, comments, checkpoint)
     if operation == "revise" and not feedback:
         raise RuntimeError("No new owner feedback found since the last Agent result")
-    ref = (pr["head"]["sha"] if pr else
+    ref = (pr["head"]["sha"] if pr else orphan_sha or
            api("GET", f"/repos/{REPO}/git/ref/heads/main")["object"]["sha"])
     payload = {"repository": REPO, "issue": issue_number, "operation": operation,
                "command_id": comment_id, "issue_title": issue["title"][:300],
@@ -218,7 +231,7 @@ def preflight(args):
                "feedback": feedback}
     Path(args.output).write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
     with Path(args.github_output).open("a") as out:
-        out.write(f"allowed=true\nbase_sha={ref}\nissue_number={issue_number}\n")
+        out.write(f"allowed=true\nbase_sha={ref}\nissue_number={issue_number}\noperation={operation}\n")
     print(f"Authorized {operation} for Issue #{issue_number}; expected source SHA {ref[:12]}")
 
 
@@ -406,6 +419,8 @@ def publish(args):
         raise RuntimeError("result artifact turn mismatch")
     # Idempotence guard for rerun of the publish job.
     for comment in pages(f"/repos/{REPO}/issues/{inp['issue']}/comments"):
+        if (comment.get("user") or {}).get("id") not in (41898282, OWNER_ID):
+            continue
         m = STATUS_RE.search(comment.get("body") or "")
         if m and (int(m[1]), int(m[2]), int(m[3])) == (
                 inp["issue"], inp["command_id"], inp["turn"]):
@@ -413,6 +428,10 @@ def publish(args):
             return
     number = inp.get("pr")
     failure = None
+    if inp["operation"] == "recover":
+        result = {"status": "ok", "continuity": "preserved",
+                  "summary": "Recovered the existing Agent branch and created the missing Draft PR without rerunning OpenCode.",
+                  "changed_files": [], "issue": inp["issue"], "turn": inp["turn"]}
     try:
         if result.get("status") != "ok":
             raise RuntimeError("Agent execution failed")
@@ -423,10 +442,14 @@ def publish(args):
             if (current["state"] != "open" or current["head"]["sha"] != inp["base_sha"]
                     or current["head"]["ref"] != inp["branch"]):
                 raise RuntimeError("PR changed since preflight; refusing stale push")
+        if inp["operation"] == "recover":
+            current = api("GET", f"/repos/{REPO}/git/ref/heads/{inp['branch']}")
+            if current["object"]["sha"] != inp["base_sha"]:
+                raise RuntimeError("orphan Agent branch moved after preflight; refuse recovery")
         patch = Path(args.patch)
-        if not patch.is_file() or patch.stat().st_size > MAX_PATCH_BYTES:
+        if inp["operation"] != "recover" and (not patch.is_file() or patch.stat().st_size > MAX_PATCH_BYTES):
             raise RuntimeError("patch artifact missing or too large")
-        if patch.stat().st_size:
+        if inp["operation"] != "recover" and patch.stat().st_size:
             git("apply", "--check", "--index", patch)
             git("apply", "--index", patch)
             paths = [x for x in git("diff", "--cached", "--name-only", "-z").stdout.split("\0") if x]
@@ -442,7 +465,7 @@ def publish(args):
             git_push(inp["branch"])
         elif inp["operation"] == "start":
             raise RuntimeError("initial implementation produced no code changes")
-        if inp["operation"] == "start":
+        if inp["operation"] in ("start", "recover"):
             title = f"agent: {inp['issue_title']}"[:200]
             body = (
                 MARKER.format(issue=inp["issue"]) + "\n\n"

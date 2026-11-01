@@ -65,6 +65,7 @@ class AuthTests(unittest.TestCase):
         checkpoint = {"id": 900, "created_at": "2026-11-01T00:00:00Z", "turn": 1}
         comments = [
             {"id": 900, "created_at": "2026-11-01T00:00:00Z",
+             "user": {"id": 41898282},
              "body": "<!-- movyrix-agent-turn:issue=42;comment=100;turn=1 -->"},
             {"id": 901, "created_at": "2026-11-01T00:01:00Z",
              "user": {"id": agent.OWNER_ID}, "body": "Change the display label"},
@@ -80,6 +81,57 @@ class AuthTests(unittest.TestCase):
         self.assertIn("display label", feedback[0]["text"])
         self.assertEqual(agent.session_id_from_events(
             '{"type":"text","part":{"sessionID":"ses_testabc"}}\n'), "ses_testabc")
+
+    def test_unauthorized_checkpoint_spoof_ignored(self):
+        comments = [
+            {"id": 100, "created_at": "2026-11-01T00:00:00Z",
+             "user": {"id": 41898282},
+             "body": "<!-- movyrix-agent-turn:issue=42;comment=100;turn=1 -->"},
+            {"id": 200, "created_at": "2026-11-01T00:01:00Z",
+             "user": {"id": 99999},
+             "body": "<!-- movyrix-agent-turn:issue=42;comment=200;turn=9000 -->"}
+        ]
+        checkpoint = agent.get_last_checkpoint(comments, 42, 0)
+        self.assertEqual(checkpoint["id"], 100)
+        self.assertEqual(checkpoint["turn"], 1)
+
+    def test_recover_orphan_branch_without_running_model(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            event = root / "event.json"
+            output = root / "out"
+            snapshot = root / "input.json"
+            event.write_text(json.dumps({
+                "issue": {"number": 42, "user": {"id": agent.OWNER_ID}},
+                "comment": {"id": 250, "body": "/agent start",
+                            "user": {"id": agent.OWNER_ID}}
+            }))
+            sha = "a" * 40
+            def fake_api(method, route, payload=None):
+                if route.endswith("/issues/42"):
+                    return {"number": 42, "state": "open", "title": "Agent test",
+                            "body": "Implement docs", "user": {"id": agent.OWNER_ID}}
+                if route.endswith("/issues/comments/250"):
+                    return {"id": 250, "user": {"id": agent.OWNER_ID},
+                            "issue_url": "https://api.github.com/repos/lithdoo-labs/movyrix/issues/42"}
+                if "/pulls?" in route:
+                    return []
+                if route.endswith("/git/ref/heads/agent/issue-42"):
+                    return {"object": {"sha": sha}}
+                if route.endswith("/commits/" + sha):
+                    return {"author": {"login": "github-actions[bot]"},
+                            "commit": {"message": "feat(agent): issue #42 turn 1"}}
+                raise AssertionError("Unexpected API: " + route)
+            with patch.object(agent, "api", side_effect=fake_api), \
+                 patch.object(agent, "pages", return_value=[]), \
+                 patch.dict(os.environ, {"GITHUB_EVENT_NAME": "issue_comment",
+                                         "ACTOR": "lithdoo"}, clear=False):
+                agent.preflight(SimpleNamespace(event=str(event), output=str(snapshot),
+                                                github_output=str(output)))
+            result = json.loads(snapshot.read_text())
+            self.assertEqual(result["operation"], "recover")
+            self.assertEqual(result["base_sha"], sha)
+            self.assertIn("operation=recover", output.read_text())
 
     def test_preflight_start_and_same_pr_revision(self):
         with tempfile.TemporaryDirectory() as root:
@@ -206,6 +258,52 @@ class RunnerIntegrationTests(unittest.TestCase):
 
 class PublishIntegrationTests(unittest.TestCase):
     """Exercise a real bare Git remote across start and revise publications."""
+
+    def test_recover_existing_branch_creates_one_draft_without_patch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            local = root / "checkout"
+            local.mkdir()
+            run("git", "init", "-q", local)
+            run("git", "config", "user.name", "Test", cwd=local)
+            run("git", "config", "user.email", "test@example.com", cwd=local)
+            (local / "README.md").write_text("Existing AI implementation\n")
+            run("git", "add", ".", cwd=local)
+            run("git", "commit", "-qm", "feat(agent): issue #42 turn 1", cwd=local)
+            sha = run("git", "rev-parse", "HEAD", cwd=local).stdout.strip()
+            input_path = root / "input.json"
+            input_path.write_text(json.dumps({
+                "issue": 42, "turn": 2, "operation": "recover",
+                "command_id": 1001, "branch": "agent/issue-42",
+                "base_sha": sha, "pr": None, "issue_title": "Recover test"
+            }))
+            posts = []
+            def fake_api(method, route, payload=None):
+                if method == "GET" and route.endswith("/git/ref/heads/agent/issue-42"):
+                    return {"object": {"sha": sha}}
+                if method == "POST" and route.endswith("/pulls"):
+                    posts.append(("pr", payload))
+                    return {"number": 88}
+                if method == "POST" and route.endswith("/issues/42/comments"):
+                    posts.append(("comment", payload))
+                    return {"id": 33}
+                raise AssertionError(f"Unexpected {method} {route}")
+            old_cwd = Path.cwd()
+            os.chdir(local)
+            try:
+                with patch.object(agent, "api", side_effect=fake_api), \
+                     patch.object(agent, "pages", return_value=[]), \
+                     patch.dict(os.environ, {"GH_TOKEN": "test-token"}, clear=False):
+                    agent.publish(SimpleNamespace(
+                        input=str(input_path),
+                        result=str(root / "does-not-exist.json"),
+                        patch=str(root / "does-not-exist.patch")))
+            finally:
+                os.chdir(old_cwd)
+            self.assertEqual([kind for kind, _ in posts], ["pr", "comment"])
+            self.assertTrue(posts[0][1]["draft"])
+            self.assertIn("PR: #88", posts[1][1]["body"])
+            self.assertIn("Session: **preserved**", posts[1][1]["body"])
 
     def test_first_turn_opens_draft_and_next_turn_reuses_pr(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -50,6 +50,7 @@ jobs:
       allowed: ${{ steps.preflight.outputs.allowed }}
       base_sha: ${{ steps.preflight.outputs.base_sha }}
       issue_number: ${{ steps.preflight.outputs.issue_number }}
+      operation: ${{ steps.preflight.outputs.operation }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -79,7 +80,7 @@ jobs:
   execute:
     name: OpenCode turn on organization runner
     needs: preflight
-    if: needs.preflight.outputs.allowed == 'true'
+    if: needs.preflight.outputs.allowed == 'true' && needs.preflight.outputs.operation != 'recover'
     runs-on: [self-hosted, linux, x64, opencode, labs]
     timeout-minutes: 90
     permissions:
