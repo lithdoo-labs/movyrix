@@ -38,11 +38,11 @@ The publisher rejects modifications to .github/, scripts/issue_agent/, AGENTS.md
 - Git branch: **agent/issue-N**
 - PR: one Draft PR per Issue, with explicit marker in its body
 - Session metadata: **/runner/state/lithdoo-labs-org/agent-projects/movyrix/issues/issue-N/metadata.json**
-- Stable workspace: **/runner/state/lithdoo-labs-org/agent-projects/movyrix/issues/issue-N/workspace**
+- Execution worktree: **$GITHUB_WORKSPACE** in the organization Runner job (the trusted checkout is refreshed each turn). OpenCode runs directly in this worktree; its **session data**, not the checkout, is persisted separately.
 - OpenCode data: **/runner/state/lithdoo-labs-org/agent-projects/movyrix/opencode-data**
 - Published Issue comments contain a marker identifying the processed turn and triggering comment.
 
-A revision refuses to start if the original session has been lost; it does not pretend a new model session has the same context. PRs that are already closed or merged cannot be revised. Use a new Issue for a new task.
+A revision refuses to start if the original session has been lost; it does not pretend a new model session has the same context. After a failed first publication with no PR, a fresh /agent start resumes the saved initial session rather than discarding it. PRs that are already closed or merged cannot be revised. Use a new Issue for a new task.
 
 GitHub Actions concurrency avoids overlapping running jobs for the same Issue, but GitHub can replace pending jobs. The next accepted revision includes all owner-authored feedback since the most recent published checkpoint. A changed PR HEAD makes the current publication fail rather than overwriting human commits.
 
