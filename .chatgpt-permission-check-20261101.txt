@@ -1,5 +1,0 @@
-Permission verification only.
-Repository: lithdoo-labs/movyrix
-Date: 2026-11-01
-This file was committed to a temporary branch for testing GitHub connector write and pull request capabilities.
-No production code was changed.
