@@ -259,6 +259,52 @@ class RunnerIntegrationTests(unittest.TestCase):
 class PublishIntegrationTests(unittest.TestCase):
     """Exercise a real bare Git remote across start and revise publications."""
 
+    def test_recover_existing_branch_creates_one_draft_without_patch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            local = root / "checkout"
+            local.mkdir()
+            run("git", "init", "-q", local)
+            run("git", "config", "user.name", "Test", cwd=local)
+            run("git", "config", "user.email", "test@example.com", cwd=local)
+            (local / "README.md").write_text("Existing AI implementation\n")
+            run("git", "add", ".", cwd=local)
+            run("git", "commit", "-qm", "feat(agent): issue #42 turn 1", cwd=local)
+            sha = run("git", "rev-parse", "HEAD", cwd=local).stdout.strip()
+            input_path = root / "input.json"
+            input_path.write_text(json.dumps({
+                "issue": 42, "turn": 2, "operation": "recover",
+                "command_id": 1001, "branch": "agent/issue-42",
+                "base_sha": sha, "pr": None, "issue_title": "Recover test"
+            }))
+            posts = []
+            def fake_api(method, route, payload=None):
+                if method == "GET" and route.endswith("/git/ref/heads/agent/issue-42"):
+                    return {"object": {"sha": sha}}
+                if method == "POST" and route.endswith("/pulls"):
+                    posts.append(("pr", payload))
+                    return {"number": 88}
+                if method == "POST" and route.endswith("/issues/42/comments"):
+                    posts.append(("comment", payload))
+                    return {"id": 33}
+                raise AssertionError(f"Unexpected {method} {route}")
+            old_cwd = Path.cwd()
+            os.chdir(local)
+            try:
+                with patch.object(agent, "api", side_effect=fake_api), \
+                     patch.object(agent, "pages", return_value=[]), \
+                     patch.dict(os.environ, {"GH_TOKEN": "test-token"}, clear=False):
+                    agent.publish(SimpleNamespace(
+                        input=str(input_path),
+                        result=str(root / "does-not-exist.json"),
+                        patch=str(root / "does-not-exist.patch")))
+            finally:
+                os.chdir(old_cwd)
+            self.assertEqual([kind for kind, _ in posts], ["pr", "comment"])
+            self.assertTrue(posts[0][1]["draft"])
+            self.assertIn("PR: #88", posts[1][1]["body"])
+            self.assertIn("Session: **preserved**", posts[1][1]["body"])
+
     def test_first_turn_opens_draft_and_next_turn_reuses_pr(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
