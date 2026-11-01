@@ -238,6 +238,38 @@ class RunnerIntegrationTests(unittest.TestCase):
         self.assertEqual(json.loads((self.state / "issues/issue-42/metadata.json").read_text())["turn"], 2)
         self.assertGreater(len(patch_two), 0)
 
+    def test_python_cache_generated_by_model_tests_is_excluded_from_patch(self):
+        contents = self.binary.read_text()
+        marker = "    p=pathlib.Path('README.md')\n"
+        self.assertIn(marker, contents)
+        insertion = (
+            "    cache=pathlib.Path('scripts/issue_agent/__pycache__/agent.cpython-311.pyc')\n"
+            "    cache.parent.mkdir(parents=True, exist_ok=True)\n"
+            "    cache.write_bytes(b'compiled python cache')\n"
+        )
+        self.binary.write_text(contents.replace(marker, insertion + marker))
+        result, patch_data = self.execute("start", 1)
+        self.assertEqual(result["status"], "ok", result)
+        self.assertEqual(result["changed_files"], ["README.md"])
+        self.assertIn(b"OpenCode changed the project", patch_data)
+        self.assertNotIn(b"__pycache__", patch_data)
+        self.assertTrue((self.source / "scripts/issue_agent/__pycache__/agent.cpython-311.pyc").exists())
+
+    def test_protected_real_script_changes_still_blocked(self):
+        contents = self.binary.read_text()
+        marker = "    p=pathlib.Path('README.md')\n"
+        self.assertIn(marker, contents)
+        insertion = (
+            "    unsafe=pathlib.Path('scripts/issue_agent/agent.py')\n"
+            "    unsafe.parent.mkdir(parents=True, exist_ok=True)\n"
+            "    unsafe.write_text('modified by model')\n"
+        )
+        self.binary.write_text(contents.replace(marker, insertion + marker))
+        result, patch_data = self.execute("start", 1)
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("protected or invalid path", result["summary"])
+        self.assertEqual(patch_data, b"")
+
     def test_failed_first_publication_reuses_session_on_start_retry(self):
         initial, _ = self.execute("start", 1)
         self.assertEqual(initial["status"], "ok", initial)
